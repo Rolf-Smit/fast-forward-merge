@@ -2,7 +2,8 @@ name: Fast-forward Merge on PR Comment
 
 permissions:
   contents: write
-  pull-requests: read
+  pull-requests: write
+  issues: write
 
 on:
   issue_comment:
@@ -29,17 +30,60 @@ jobs:
             core.setOutput('head', pr.head.ref);
             core.setOutput('headRepo', pr.head.repo.full_name);
 
-      - name: Check PR targets main
-        if: steps.pr.outputs.base == 'main'
-        run: echo "PR targets main branch"
+      - name: Guard rails – Must be main <- release/*
+        id: guard
+        run: |
+          echo "Base branch: ${{ steps.pr.outputs.base }}"
+          echo "Head branch: ${{ steps.pr.outputs.head }}"
+
+          if [[ "${{ steps.pr.outputs.base }}" != "main" ]]; then
+            echo "Base is NOT main!"
+            echo "valid=false" >> $GITHUB_OUTPUT
+            echo "reason=target_not_main" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          if [[ ! "${{ steps.pr.outputs.head }}" =~ ^release/.*$ ]]; then
+            echo "Head is NOT release/*!"
+            echo "valid=false" >> $GITHUB_OUTPUT
+            echo "reason=source_not_release" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Both target and source are valid for release FF."
+          echo "valid=true" >> $GITHUB_OUTPUT
+          echo "reason=none" >> $GITHUB_OUTPUT
+
+      - name: Comment if PR does not meet requirements
+        if: steps.guard.outputs.valid == 'false'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const pr_number = context.payload.issue.number;
+            let message = '';
+            if ('${{ steps.guard.outputs.reason }}' === 'target_not_main') {
+              message = '🚫 **Fast-forward release not allowed!**\n\nThe base branch of this PR must be `main` for `/release` to work.';
+            } else if ('${{ steps.guard.outputs.reason }}' === 'source_not_release') {
+              message = '🚫 **Fast-forward release not allowed!**\n\nThe head branch must be a `release/*` branch for `/release` to work.';
+            } else {
+              message = '🚫 **Fast-forward release not allowed!**\n\nThis workflow only supports `/release` comments where the base branch is `main` and the head is a `release/*` branch.';
+            }
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: pr_number,
+              body: message
+            });
 
       - name: Checkout main branch
+        if: steps.guard.outputs.valid == 'true'
         uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 0
 
       - name: Add PR branch as remote and fetch
+        if: steps.guard.outputs.valid == 'true'
         run: |
           echo "Head repo: ${{ steps.pr.outputs.headRepo }}"
           echo "Head branch: ${{ steps.pr.outputs.head }}"
@@ -47,10 +91,37 @@ jobs:
           git fetch prhead ${{ steps.pr.outputs.head }}
 
       - name: Try fast-forward merge
+        if: steps.guard.outputs.valid == 'true'
+        id: ff_merge
+        continue-on-error: true
         run: |
           git merge --ff-only prhead/${{ steps.pr.outputs.head }}
 
+      # (If needed) Checkout default branch again (for correct templates)
+      - name: Checkout default branch again
+        if: steps.ff_merge.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - name: Comment on PR if fast-forward merge failed
+        if: steps.ff_merge.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const pr_number = context.payload.issue.number;
+            const fs = require('fs');
+            let message = fs.readFileSync('.github/workflows/fast-forward-merge/comment-fast-forward-failed.md', 'utf8');
+            message = message.replace(/\{\{source\}\}/g, steps.pr.outputs.head);
+
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: pr_number,
+              body: message
+            });
+
       - name: Push result (if merge succeeded)
+        if: steps.ff_merge.outcome == 'success'
         run: |
           git push origin main
         env:
