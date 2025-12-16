@@ -2,7 +2,8 @@ name: Fast-forward Merge on PR Comment
 
 permissions:
   contents: write
-  pull-requests: read
+  pull-requests: write
+  issues: write
 
 on:
   issue_comment:
@@ -47,10 +48,30 @@ jobs:
           git fetch prhead ${{ steps.pr.outputs.head }}
 
       - name: Try fast-forward merge
+        id: ff_merge
+        continue-on-error: true
         run: |
           git merge --ff-only prhead/${{ steps.pr.outputs.head }}
 
+      - name: Comment on PR if fast-forward merge failed
+        if: steps.ff_merge.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const pr_number = context.payload.issue.number;
+            const fs = require('fs');
+            let message = fs.readFileSync('.github/workflows/fast-forward-merge/comment-fast-forward-failed.md', 'utf8');
+            message = message.replace(/\{\{source\}\}/g, steps.pr.outputs.head);
+
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: pr_number,
+              body: message
+            });
+
       - name: Push result (if merge succeeded)
+        if: steps.ff_merge.outcome == 'success'
         run: |
           git push origin main
         env:
